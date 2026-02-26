@@ -1,5 +1,5 @@
 %% ================== CONFIG (editables) ==================
-baseFolder = 'Z:\mh-kin\yaksi\temp\Emilian temp\ccn2a\light tap free tail';
+baseFolder = '\\forskning.it.ntnu.no\ntnu\mh\kin\yaksi\5\Emiliano\ccn2a\light_tap_free_tail';
 saveName   = 'per_fish_domfreqs_powerSpecs.mat';
 
 % analysis window in *seconds* relative to the start of the loaded traces
@@ -131,72 +131,88 @@ save(fullfile(baseFolder, saveName), ...
      'fps_by_fish','type_by_fish','fish','resultsFiles','metaFiles','validFolders','-v7.3');
 
 %% ================== 4) QUICK PLOTS (same style as before) ==================
-% choose which fish to include
-if exist('binEdges11','var') && numel(binEdges11) >= 2
-    edges = binEdges11(:).';                    % <- use Fig 2's edges
-elseif ~exist('edges','var') || numel(edges) < 2
-    edges = linspace(0, 0.10, 12);              % fallback: 11 bins
-end
-centers = edges(1:end-1) + diff(edges)/2;
+%% ================== 1) % HISTOGRAM + PER-FISH SCATTER ==================
+% custom bins: 0–0.018, 0.018–0.055, 0.055–0.091, 0.091–0.10 Hz
+edgesHist = [0, 0.018, 0.055, 0.091, 0.10];
+binLabels = {'0–0.018','0.018–0.055','0.055–0.091','0.091–0.10'};
+nBinsHist = numel(edgesHist) - 1;
+xCats     = 1:nBinsHist;   % categorical x positions (equal width on the plot)
 
-% choose which fish to include
-groupSel = "in_vivo";  % "in_vivo", "explant", or "all"
-if groupSel ~= "all"
-    useFish = (type_by_fish==groupSel);
-else
-    useFish = true(numel(domFreqs_by_fish),1);
-end
-% (a) histogram + per-fish scatter
+% pooled dom freqs within edges
 allDom = vertcat(domFreqs_by_fish{useFish});
-allDom = allDom(~isnan(allDom) & allDom>=edges(1) & allDom<=edges(end));
+allDom = allDom(~isnan(allDom) & allDom>=edgesHist(1) & allDom<=edgesHist(end));
+
+% pooled percentages per bin
+pctPooled = histcounts(allDom, edgesHist, 'Normalization','percentage');
 
 figure('Color','w'); hold on;
-histogram(allDom,'BinEdges',edges,'DisplayStyle','stairs','LineWidth',3, ...
-          'EdgeColor',col,'Normalization','percentage');
-% vertical dotted lines at bin edges (to mirror Fig 2)
-arrayfun(@(x) xline(x,':k','LineWidth',0.75), edges);
 
-xlabel('Dominant frequency (Hz)'); ylabel('Neuron percentage');
-title('Distribution of dominant frequencies (pooled)');
+% bars with equal width (categorical look)
+bar(xCats, pctPooled, 1.0, 'FaceColor','none', 'EdgeColor', col, 'LineWidth', 3);
 
+% overlay per-fish percentages as scatter at same x positions
 for f = find(useFish(:))'
     v = domFreqs_by_fish{f};
-    v = v(~isnan(v) & v>=edges(1) & v<=edges(end));
+    v = v(~isnan(v) & v>=edgesHist(1) & v<=edgesHist(end));
     if isempty(v), continue; end
-    frac = histcounts(v, edges, 'Normalization','percentage');
-    scatter(centers, frac, 20, col, 'filled', ...
+    frac = histcounts(v, edgesHist, 'Normalization','percentage'); % 1x4
+    scatter(xCats, frac, 40, col, 'filled', ...
             'MarkerFaceAlpha',0.25, 'MarkerEdgeAlpha',0.25);
 end
-box off; grid off; xlim([edges(1) edges(end)]);
 
-% (b) power at dom freq vs dom freq (per-fish dots)
+% categorical-like x-axis
+xticks(xCats);
+xticklabels(binLabels);
+xlim([0.5, nBinsHist+0.5]);
+
+ylabel('Neuron percentage');
+xlabel('Dominant frequency (Hz)');
+title('Distribution of dominant frequencies (pooled)');
+
+
+%% ================== POWER @ DOM FREQ VS FREQUENCY (OWN FIGURE) ==================
+% Reuse the same non-uniform edges; define centers for the X positions
+edges   = edgesHist;                                   % reuse
+centers = edges(1:end-1) + diff(edges)/2;              % 4 bin centers
+
 normMode = 'area';   % 'area' | 'max' | 'none'
+
 nBins  = numel(centers);
-perFishMedP = nan(sum(useFish), nBins);
-allBinIdx = []; allPeakP = [];
-fishList = find(useFish(:))'; row = 0;
+perFishMedP = nan(sum(useFish), nBins);     % rows = fish, cols = freq bins
+allBinIdx = [];
+allPeakP  = [];
+
+fishList = find(useFish(:))';
+row = 0;
 
 for f = fishList
-    dom = domFreqs_by_fish{f};     if isempty(dom), continue; end
+    dom = domFreqs_by_fish{f};            if isempty(dom), continue; end
     dom = dom(:);
-    P   = powerSpecs_by_fish{f};   if isempty(P),   continue; end
-    F   = freqBins_by_fish{f};     if isempty(F),   continue; end
+    P   = powerSpecs_by_fish{f};           if isempty(P),   continue; end
+    F   = freqBins_by_fish{f};             if isempty(F),   continue; end
     F   = F(:).';
 
+    % orient/align P with F
     if size(P,2) ~= numel(F) && size(P,1) == numel(F), P = P.'; end
-    m = min(size(P,2), numel(F));  P = P(:,1:m); F = F(1:m);
+    m = min(size(P,2), numel(F));  P = P(:,1:m);  F = F(1:m);
     n = min(size(P,1), numel(dom)); P = P(1:n,:); dom = dom(1:n);
+    if n==0, continue; end
 
     % convert F to Hz if needed
-    fps = fps_by_fish(f);
+    fps = NaN;
+    if exist('fps_by_fish','var') && numel(fps_by_fish)>=f && ~isnan(fps_by_fish(f))
+        fps = fps_by_fish(f);
+    elseif exist('fish','var') && numel(fish)>=f && isfield(fish,'fps') && ~isempty(fish(f).fps)
+        fps = fish(f).fps;
+    end
     if ~isnan(fps)
         mxF = max(F);
-        if mxF <= pi + 1e-6,      F = F * (fps/(2*pi));
-        elseif mxF <= 0.5 + 1e-6, F = F * fps;
+        if mxF <= pi + 1e-6,      F = F * (fps/(2*pi));    % rad/sample -> Hz
+        elseif mxF <= 0.5 + 1e-6, F = F * fps;             % cycles/sample -> Hz
         end
     end
 
-    % normalize power (robust area-normalization)
+    % normalize power (area within plotting band)
     switch lower(normMode)
         case 'area'
             idxF = find(F >= edges(1) & F <= edges(end));
@@ -204,9 +220,6 @@ for f = fishList
                 Pband = P(:, idxF);
                 areas = trapz(F(idxF), Pband, 2);
                 P(:, idxF) = Pband ./ max(eps, areas);
-            elseif numel(idxF) == 1         % single-bin fallback
-                df_eff = min([diff(F)'; edges(end)-edges(1)]);
-                P(:, idxF) = P(:, idxF) ./ max(eps, P(:, idxF) * df_eff);
             else
                 areasAll = trapz(F, P, 2);
                 P = P ./ max(eps, areasAll);
@@ -214,14 +227,14 @@ for f = fishList
         case 'max'
             P = P ./ max(eps, max(P, [], 2));
         case 'none'
-            % do nothing
+            % no-op
     end
 
-    % nearest freq-bin to each dom
+    % power at the nearest spectral bin to each neuron's dominant freq
     [~, idxNearest] = min(abs(dom - F), [], 2);
-    idxNearest = idxNearest(:);
     peakP = arrayfun(@(i) P(i, idxNearest(i)), 1:n).';
 
+    % bin + collect with the same non-uniform edges
     keep = isfinite(dom) & isfinite(peakP) & dom>=edges(1) & dom<=edges(end);
     if ~any(keep), continue; end
     b = discretize(dom(keep), edges);
@@ -234,19 +247,26 @@ for f = fishList
 end
 perFishMedP = perFishMedP(1:row,:);
 
+% pooled median across all neurons (optional summary line)
 if isempty(allBinIdx)
     medPooled = nan(1,nBins);
 else
     medPooled = accumarray(allBinIdx, allPeakP, [nBins,1], @median, NaN).';
 end
 
+% plot per-fish dots at the same 4 categorical x positions
 figure('Color','w'); hold on;
 for r = 1:size(perFishMedP,1)
-    scatter(centers, perFishMedP(r,:), 20, col, 'filled', ...
+    scatter(1:nBins, perFishMedP(r,:), 20, col, 'filled', ...
             'MarkerFaceAlpha',0.55, 'MarkerEdgeAlpha',0.55);
 end
-% same vertical bin lines as Fig 2
-% arrayfun(@(x) xline(x,':k','LineWidth',0.75), edges);
+% optional pooled line:
+% plot(1:nBins, medPooled, '-','Color',col,'LineWidth',3);
+
+% categorical-like x-axis using your labels
+xticks(1:nBins);
+xticklabels(binLabels);
+xlim([0.5, nBins+0.5]);
 
 xlabel('Dominant frequency (Hz)');
 switch lower(normMode)
@@ -255,9 +275,151 @@ switch lower(normMode)
     otherwise,   ylabel('Power at dominant frequency (a.u.)');
 end
 title(sprintf('Power vs dominant frequency (%s-normalized)', normMode));
-grid off; box off; xlim([edges(1) edges(end)]);
+grid off; box off;
+
+% robust y-limit
 yAll = [perFishMedP(:); medPooled(:)];
-if all(isnan(yAll)), ylim([0 1]); else, ylim([0, prctile(yAll(~isnan(yAll)), 99)]); end
+if all(isnan(yAll))
+    ylim([0 1]);
+else
+    ylim([0, floor(prctile(yAll(~isnan(yAll)), 99))]);
+end
+
+
+% % choose which fish to include
+% % if exist('binEdges11','var') && numel(binEdges11) >= 2
+% %     edges = binEdges11(:).';                    % <- use Fig 2's edges
+% % elseif ~exist('edges','var') || numel(edges) < 2
+% %     edges = linspace(0, 0.10, 12);              % fallback: 11 bins
+% % end
+% % centers = edges(1:end-1) + diff(edges)/2;
+% 
+% % Custom bins: [0–0.018], [0.018–0.055], [0.055–0.091], [0.091–1]
+% edges = [0, 0.018, 0.055, 0.091, 1.0];
+% centers = edges(1:end-1) + diff(edges)/2;
+% 
+% % (optional) keep x-axis comparable to Fig 2 (0–0.10 Hz); otherwise remove
+% xlim_plot = [0, 0.10];   % set [] to auto
+% 
+% % choose which fish to include
+% groupSel = "in_vivo";  % "in_vivo", "explant", or "all"
+% if groupSel ~= "all"
+%     useFish = (type_by_fish==groupSel);
+% else
+%     useFish = true(numel(domFreqs_by_fish),1);
+% end
+% % (a) histogram + per-fish scatter
+% allDom = vertcat(domFreqs_by_fish{useFish});
+% allDom = allDom(~isnan(allDom) & allDom>=edges(1) & allDom<=edges(end));
+% 
+% figure('Color','w'); hold on;
+% histogram(allDom,'BinEdges',edges,'DisplayStyle','stairs','LineWidth',3, ...
+%           'EdgeColor',col,'Normalization','percentage');
+% % vertical dotted lines at bin edges (to mirror Fig 2)
+% % arrayfun(@(x) xline(x,':k','LineWidth',0.75), edges);
+% 
+% xlabel('Dominant frequency (Hz)'); ylabel('Neuron percentage');
+% title('Distribution of dominant frequencies (pooled)');
+% 
+% for f = find(useFish(:))'
+%     v = domFreqs_by_fish{f};
+%     v = v(~isnan(v) & v>=edges(1) & v<=edges(end));
+%     if isempty(v), continue; end
+%     frac = histcounts(v, edges, 'Normalization','percentage');
+%     scatter(centers, frac, 20, col, 'filled', ...
+%             'MarkerFaceAlpha',0.25, 'MarkerEdgeAlpha',0.25);
+% end
+% box off; grid off; xlim([edges(1) edges(end)]);
+% 
+% % (b) power at dom freq vs dom freq (per-fish dots)
+% normMode = 'area';   % 'area' | 'max' | 'none'
+% nBins  = numel(centers);
+% perFishMedP = nan(sum(useFish), nBins);
+% allBinIdx = []; allPeakP = [];
+% fishList = find(useFish(:))'; row = 0;
+% 
+% for f = fishList
+%     dom = domFreqs_by_fish{f};     if isempty(dom), continue; end
+%     dom = dom(:);
+%     P   = powerSpecs_by_fish{f};   if isempty(P),   continue; end
+%     F   = freqBins_by_fish{f};     if isempty(F),   continue; end
+%     F   = F(:).';
+% 
+%     if size(P,2) ~= numel(F) && size(P,1) == numel(F), P = P.'; end
+%     m = min(size(P,2), numel(F));  P = P(:,1:m); F = F(1:m);
+%     n = min(size(P,1), numel(dom)); P = P(1:n,:); dom = dom(1:n);
+% 
+%     % convert F to Hz if needed
+%     fps = fps_by_fish(f);
+%     if ~isnan(fps)
+%         mxF = max(F);
+%         if mxF <= pi + 1e-6,      F = F * (fps/(2*pi));
+%         elseif mxF <= 0.5 + 1e-6, F = F * fps;
+%         end
+%     end
+% 
+%     % normalize power (robust area-normalization)
+%     switch lower(normMode)
+%         case 'area'
+%             idxF = find(F >= edges(1) & F <= edges(end));
+%             if numel(idxF) >= 2
+%                 Pband = P(:, idxF);
+%                 areas = trapz(F(idxF), Pband, 2);
+%                 P(:, idxF) = Pband ./ max(eps, areas);
+%             elseif numel(idxF) == 1         % single-bin fallback
+%                 df_eff = min([diff(F)'; edges(end)-edges(1)]);
+%                 P(:, idxF) = P(:, idxF) ./ max(eps, P(:, idxF) * df_eff);
+%             else
+%                 areasAll = trapz(F, P, 2);
+%                 P = P ./ max(eps, areasAll);
+%             end
+%         case 'max'
+%             P = P ./ max(eps, max(P, [], 2));
+%         case 'none'
+%             % do nothing
+%     end
+% 
+%     % nearest freq-bin to each dom
+%     [~, idxNearest] = min(abs(dom - F), [], 2);
+%     idxNearest = idxNearest(:);
+%     peakP = arrayfun(@(i) P(i, idxNearest(i)), 1:n).';
+% 
+%     keep = isfinite(dom) & isfinite(peakP) & dom>=edges(1) & dom<=edges(end);
+%     if ~any(keep), continue; end
+%     b = discretize(dom(keep), edges);
+% 
+%     allBinIdx = [allBinIdx; b(:)];
+%     allPeakP  = [allPeakP;  peakP(keep)];
+% 
+%     row = row + 1;
+%     perFishMedP(row,:) = accumarray(b(:), peakP(keep), [nBins,1], @median, NaN).';
+% end
+% perFishMedP = perFishMedP(1:row,:);
+% 
+% if isempty(allBinIdx)
+%     medPooled = nan(1,nBins);
+% else
+%     medPooled = accumarray(allBinIdx, allPeakP, [nBins,1], @median, NaN).';
+% end
+% 
+% figure('Color','w'); hold on;
+% for r = 1:size(perFishMedP,1)
+%     scatter(centers, perFishMedP(r,:), 20, col, 'filled', ...
+%             'MarkerFaceAlpha',0.55, 'MarkerEdgeAlpha',0.55);
+% end
+% % same vertical bin lines as Fig 2
+% % arrayfun(@(x) xline(x,':k','LineWidth',0.75), edges);
+% 
+% xlabel('Dominant frequency (Hz)');
+% switch lower(normMode)
+%     case 'area', ylabel('Power density at dominant frequency (1/Hz)');
+%     case 'max',  ylabel('Relative power at dominant frequency (a.u., max=1)');
+%     otherwise,   ylabel('Power at dominant frequency (a.u.)');
+% end
+% title(sprintf('Power vs dominant frequency (%s-normalized)', normMode));
+% grid off; box off; xlim([edges(1) edges(end)]);
+% yAll = [perFishMedP(:); medPooled(:)];
+% if all(isnan(yAll)), ylim([0 1]); else, ylim([0, prctile(yAll(~isnan(yAll)), 99)]); end
 %% ================== 5) Q-FACTOR LME ==================
 Q_all=[]; f0_all=[]; fish_all=[]; type_all=strings(0,1);
 fishList = find(useFish(:))';
