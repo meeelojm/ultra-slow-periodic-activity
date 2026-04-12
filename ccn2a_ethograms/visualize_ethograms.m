@@ -19,7 +19,7 @@ for iFish = 1:numel(fishList)
             continue
         end
 
-        files = dir(fullfile(folderNow, 'ethogram*.mat'));
+        files = dir(fullfile(folderNow, 'ethogram_????????_??????.mat'));;
 
         if isempty(files)
             fprintf('No ethogram files in: %s\n', folderNow);
@@ -40,7 +40,7 @@ for iFish = 1:numel(fishList)
                 rat_tim_par = rat_bin_par;
                 tai_sig = [];
 
-                figure('Color','w','Name',files(iFile).name,'NumberTitle','off');
+                %figure('Color','w','Name',files(iFile).name,'NumberTitle','off');
 
                 plo_eth_subplots(sta_tim, end_tim, ...
                     dru_ons, sti_ons, tai_bea, hea_bea, ope_bea, mou_bea, eye_bea, ...
