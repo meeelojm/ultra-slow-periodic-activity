@@ -1,0 +1,196 @@
+%% LOADING DATA
+baseFolder = 'Z:\temp\Emilian temp\ccn2a\high2low\f010\lowact\suite2p';
+
+% Get all subfolders (including base)
+allFolders = strsplit(genpath(baseFolder), pathsep);
+
+% Prepare output
+validFolders = {};
+
+% Regexes for the two wildcard patterns:
+imaPattern  = '^\d{2}-\d{2}-\d{4}_\d_\d\.mat$';
+robPattern  = '^Robbrecht_experiment\d+_trial\d+_TID\d+\.mat$';
+
+for i = 1:numel(allFolders)
+    curF = allFolders{i};
+    if isempty(curF), continue; end
+
+    % 1) Fixed names
+    repact_file   = fullfile(curF, 'dffs_repact_respcells.mat');
+    metadata_file = fullfile(curF, 'metadata_multimodal.mat');
+
+    % 2) Grab every .mat in the folder
+    listing = dir(fullfile(curF, '*.mat'));
+
+    % 3) Filter ima_fis
+    ima_files = {};
+    % 4) Filter Robbrecht/TID
+    rob_files = {};
+    for k = 1:numel(listing)
+        nm = listing(k).name;
+        if ~isempty( regexp(nm, imaPattern, 'once') )
+            ima_files{end+1} = fullfile(curF, nm);  %#ok<SAGROW>
+        elseif ~isempty( regexp(nm, robPattern, 'once') )
+            rob_files{end+1} = fullfile(curF, nm);  %#ok<SAGROW>
+        end
+    end
+
+    % 5) Only keep folders that have everything
+    if exist(repact_file, 'file')==2 && ...
+       exist(metadata_file, 'file')==2    && ...
+       ~isempty(ima_files)                && ...
+       ~isempty(rob_files)
+
+       validFolders{end+1} = struct( ...
+           'folder',    curF, ...
+           'repact_file',    repact_file, ...
+           'fil_pat_exp',  metadata_file, ...
+           'fil_pat_ima_fis',   {ima_files}, ...
+           'fil_pat_tai',  {rob_files});  %#ok<SAGROW>
+    end
+end
+
+% Report
+fprintf('Found %d valid folders:\n', numel(validFolders));
+for i = 1:numel(validFolders)
+    vf = validFolders{i};
+    fprintf('\nFolder: %s\n', vf.folder);
+    % fprintf('  - repact:   %s\n', vf.repact);
+    % fprintf('  - metadata: %s\n', vf.metadata);
+    % fprintf('  - ima_fis (%d):\n', numel(vf.ima_fis));
+    % fprintf('      %s\n', vf.ima_fis{:});
+    % fprintf('  - rob_tids (%d):\n', numel(vf.rob_tids));
+    % fprintf('      %s\n', vf.rob_tids{:});
+end
+%%
+set(0,'defaultfigurecolor',[1 1 1])
+%for 
+u = [1]%numel(validFolders)[1 2 5 7 9 10] [1 2 7 9 10] is mph=0.19, [6 8 11] is mph=0.9 [12] no stims is [11 12 13 14] 
+% --- Tail extraction parameters and file loading ---
+    seg_len = 1024; mph_tai = 0.19; fra_mph_mpp = 0.5; tim_bas_lim = [-1 0];
+    dur_tai = 1; lat_thr = 0.3; win_siz = 120;
+    
+    repact_file     = string(validFolders{u}.repact_file);
+    fil_pat_tai     = string(validFolders{u}.fil_pat_tai);
+    fil_pat_exp     = string(validFolders{u}.fil_pat_exp);
+    fil_pat_ima_fis = string(validFolders{u}.fil_pat_ima_fis);
+    load(repact_file,"dff_new","traces","stims","positions","fps","fishID","sti_ons")
+    load(repact_file,"position"); positions = position;
+    
+    % Epoch setupioooooooooooooo
+    twomin = round(120*fps);
+    onemin = round(60*fps);
+    % train 1 + epoch 3 
+    start_frame1 = (stims(1)-onemin); end_frame1 = (stims(8)+onemin);
+    % train 2 + epoch 4
+    start_frame2 = (stims(9)-onemin); end_frame2 = (stims(16)+onemin);
+    % train 3 + epoch 5
+    start_frame3 = (stims(17)-onemin);end_frame3 = (stims(24)+onemin);
+    % --- Epoch 1 analysis --- change startframe to match stims
+    
+    % --- Extract and synchronize tail data ---
+    [tai_ang, tai_ang_spe, tai_ang_uni, fra_tim_uni, vir_spe_uni, fra_tim, ...
+        ~, ~, vir_spe, fra_ind, fra_rat_get, tim_tri_uni_fra, rec_tai_ang_uni_fra_sta_con, ...
+        n_tri_con, n_con, tai_bea, ang_ave_con_win, nta_fra_sta_con, ave_nta_con_win, ...
+        bea_lat_tri, per_pro_con, log_tri_con, bea_lat_con, ave_bas_spe, man_sec, ini_del, ...
+        tai_bea_ang] = ext_tai_dat_seg(fil_pat_tai, fil_pat_exp, fil_pat_ima_fis, seg_len, ...
+        mph_tai, fra_mph_mpp, tim_bas_lim, dur_tai, lat_thr, win_siz);
+    
+    [bou_ons_bou, bou_off_bou, dur_bou] = cal_bou_ons_bou(1, size(dff_new,2), tai_bea, fra_tim);
+    bou_ons_fra = floor(bou_ons_bou * fps); % bou_ons_bou
+    bou_off_fra = floor(bou_off_bou * fps);
+    
+    beatIdx = arrayfun(@(t) find(abs(tai_bea - t)==min(abs(tai_bea - t)),1), bou_ons_bou);
+    boutOnsetAmps = tai_bea_ang(beatIdx);
+    
+    frameTimes = (0:(size(dff_new,2)-1))' / fps;
+    beat_amp_on_frames = interp1(tai_bea, tai_bea_ang, frameTimes, 'linear');
+    
+    frameIdx = round(tai_bea * fps) + 1;
+    frameIdx(frameIdx<1 | frameIdx>numel(frameTimes)) = [];
+    beatAmpImpulse = zeros(size(frameTimes));
+    beatAmpImpulse(frameIdx) = tai_bea_ang;
+
+        % Step 1: Get the time axis for your fluorescence data
+    frameTimes = (0:(size(dff_new, 2)-1))' / fps;
+    %
+    % Step 2: Interpolate uniformly resampled virtual speed to match imaging frames
+    vir_spe_uni_frames = interp1(fra_tim_uni, vir_spe_uni, frameTimes, 'linear', 0);
+    tai_ang_uni_frames = interp1(fra_tim_uni, tai_ang_uni, frameTimes, 'linear', 0);    
+%% ethogram 
+load(fil_pat_ima_fis)
+fra = ext_fra(data,size(data,3));
+clear data
+filename = fullfile(baseFolder,'ethogram.mat');
+save(filename)
+[mas_hea, mas_gil, mas_mou, mas_eye, mas_noi] = ext_mas(fra);
+
+% --- basics ---
+fra_rat_get = 120;                          % Hz
+sta_tim = 0;
+end_tim = size(fra,3) / fra_rat_get;
+fra_tim = (0:size(fra,3)-1)'/fra_rat_get + sta_tim;
+
+% --- PCA components ---
+pri_com_hea = 1; pri_com_ope = 1; pri_com_mou = 1; pri_com_eye = 1;
+
+% --- thresholds / polarity ---
+hea_per_pro = 2;
+ope_per_pro = 10;  ope_per_wid_min = 10;  ope_per_wid_max = 90;  ope_per_dec = 60;
+mou_per_pro = 10;
+ope_dir = 1;     % set to 0 if your operculum peaks are negative-going
+mou_dir = 0;     % set to 1 if your mouth peaks are negative-going
+min_thr = 1000;    % eye change-point sensitivity (increase if too many detections)
+
+% --- spontaneous layout only ---
+dur_spo = end_tim; n_con = 0; dur_con = 0; isi = 0; dur_con_end = 0;
+
+[hea_bea, hea_sig, ope_bea, ope_sig, mou_bea, mou_sig, eye_bea, eye_sig, tim_bin, ...
+    rat_bin_par, rat_raw_bin_par, tim_rob, rat_rob, spo_bou_ons] = ext_eth_dat(sta_tim, ...
+    end_tim, fra_tim, fra, fra_rat_get, mas_hea, mas_gil, mas_mou, mas_eye, mas_noi, ...
+    tai_bea, pri_com_hea, pri_com_ope, pri_com_mou, pri_com_eye, hea_per_pro, ope_per_pro, ...
+    mou_per_pro, ope_per_wid_min, ope_per_dec, ope_per_wid_max, ope_dir, mou_dir, min_thr, ...
+    dur_spo, n_con, dur_con, isi, dur_con_end);
+%% plot ethogram
+dru_ons = [];
+sti_ons = [];
+tai_sig = [];%tai_ang(1:size(fra,3));
+% Map names used by plo_eth:
+rat_tim      = tim_bin;         % time axis for binned rates
+rat_tim_par  = rat_bin_par;     % rates per bin [tail, heart, operc, mouth, eye]
+% Optional inputs (drug/stim onsets). Empty is OK.
+dru_ons = [];                   % e.g., [120 240] in seconds if you have them
+sti_ons = [];                   % e.g., stimulus onsets as a vector (s)
+% ---------------- Colors ----------------
+% (RGB triplets in [0,1]; tweak as you like)
+col_tai     = 'b';
+col_hea     = 'r';
+col_ope     = 'g';
+col_mou     = 'm';
+col_eye     = 'c';
+
+col_tai_sig = 'b';
+col_hea_sig = 'r';
+col_ope_sig = 'g';
+col_mou_sig = 'm';
+col_eye_sig = 'c';
+
+col_rob     = 'k';
+col_dru     = 'k';
+col_sti     = [0.3 0.3 0.3];   % if used in plot(..., col_sti), switch to 'Color', col_sti in code
+col_spo_bou_ons = 'k';
+
+% ---------------- Fonts & annotations ----------------
+fon_siz     = 10;        % base font size inside plo_fis_ras_sig_rat
+
+
+% reuse your colors & inputs (char or RGB both fine)
+plo_eth_subplots(sta_tim, end_tim, ...
+dru_ons, sti_ons, tai_bea, hea_bea, ope_bea, mou_bea, eye_bea, ...
+tai_sig, hea_sig, ope_sig, mou_sig, eye_sig, ...
+rat_tim, rat_tim_par, fra_tim, tim_rob, rat_rob, spo_bou_ons, ...
+col_tai, col_hea, col_ope, col_mou, col_eye, ...
+col_tai_sig, col_hea_sig, col_ope_sig, col_mou_sig, col_eye_sig, ...
+fon_siz, col_rob, col_dru, col_sti, col_spo_bou_ons, 'Behavior summary low activity');
+
+
