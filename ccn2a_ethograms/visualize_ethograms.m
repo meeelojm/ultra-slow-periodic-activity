@@ -4,7 +4,8 @@ clear; clc;
 baseRoot = '\\forskning.it.ntnu.no\ntnu\mh\kin\yaksi\temp\Emilian temp\ccn2a\high2low';
 
 fishList = {'f010','f011','f012'};
-condList = {'highact'};
+condList = {'highact','lowact'};
+% so fat 3 fish out of 9 have the signals extracted, let's focus on the pipeline working and then I will extract the other signals
 
 for iFish = 1:numel(fishList)
     fish = fishList{iFish};
