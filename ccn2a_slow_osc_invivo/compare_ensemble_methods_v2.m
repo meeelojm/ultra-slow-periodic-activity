@@ -1,0 +1,805 @@
+function OUT = compare_ensemble_methods_v2(dff, fps, varargin)
+%COMPARE_ENSEMBLE_METHODS_V2
+% Compare ensemble-discovery approaches on calcium/dF/F data.
+%
+% METHODS TESTED
+%   1) dF/F k-means
+%   2) dF/F PCA + varimax
+%   3) ACF k-means
+%   4) ACF PCA + varimax
+%   5) cosine-similarity of population vectors + SVD
+%
+% NEW IN V2
+%   - optional ACF peak-count prefilter before ensemble testing
+%   - method-specific figures:
+%       * dF/F matrix sorted by ensemble
+%       * ACF matrix / ensemble mean ACF
+%       * evaluation metrics for that solution
+%
+% INPUT
+%   dff : [N x T] neurons x time
+%   fps : scalar sampling rate
+%
+% KEY OUTPUTS
+%   OUT.summaryTable
+%   OUT.methods(i).labels
+%   OUT.methods(i).eval
+%   OUT.best
+%
+% RECOMMENDED USAGE
+%   OUT = compare_ensemble_methods_v2(dff, fps, ...
+%       'UseZScore', true, ...
+%       'KList', 2:6, ...
+%       'AcfFeatureLagRangeSec', [10 120], ...
+%       'EnableAcfPeakPrefilter', true, ...
+%       'AcfPeakLagRangeSec', [10 120], ...
+%       'AcfMinProminence', 0.13, ...
+%       'MinNumAcPeaks', 2, ...
+%       'DoPlots', true);
+
+%% ============================ Parse inputs ============================
+ip = inputParser;
+ip.FunctionName = mfilename;
+
+addRequired(ip, 'dff', @(x) isnumeric(x) && ndims(x)==2);
+addRequired(ip, 'fps', @(x) isnumeric(x) && isscalar(x) && x > 0);
+
+% base preprocessing
+addParameter(ip, 'UseZScore', true, @(x) islogical(x) || isnumeric(x));
+addParameter(ip, 'FiniteFracThresh', 0.95, @(x) isnumeric(x) && isscalar(x) && x > 0 && x <= 1);
+addParameter(ip, 'MinStd', 0, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+
+% kmeans / varimax
+addParameter(ip, 'KList', 2:6, @(x) isnumeric(x) && isvector(x) && all(x>=2));
+addParameter(ip, 'Replicates', 20, @(x) isnumeric(x) && isscalar(x) && x>=1);
+addParameter(ip, 'Distance', 'correlation', @(x) ischar(x) || isstring(x));
+addParameter(ip, 'VarimaxExplainedPct', 80, @(x) isnumeric(x) && isscalar(x) && x > 0 && x <= 100);
+addParameter(ip, 'MaxVarimaxComps', 8, @(x) isnumeric(x) && isscalar(x) && x >= 2);
+
+% acf / psd features
+addParameter(ip, 'AcfMaxLagSec', 180, @(x) isnumeric(x) && isscalar(x) && x > 0);
+addParameter(ip, 'AcfFeatureLagRangeSec', [0 120], @(x) isnumeric(x) && numel(x)==2 && x(1)>=0 && x(2)>x(1));
+
+addParameter(ip, 'WelchWinSec', 120, @(x) isnumeric(x) && isscalar(x) && x > 0);
+addParameter(ip, 'WelchOverlapFrac', 0.5, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x < 1);
+addParameter(ip, 'FreqRangeHz', [0.005 0.2], @(x) isnumeric(x) && numel(x)==2 && x(1)>0 && x(2)>x(1));
+
+% cosine-SVD
+addParameter(ip, 'RunCosineSVD', false, @(x) islogical(x) || isnumeric(x));
+addParameter(ip, 'SVDNumModesList', 2:6, @(x) isnumeric(x) && isvector(x) && all(x>=2));
+addParameter(ip, 'SVDSignalMode', 'diff', @(x) ischar(x) || isstring(x));
+addParameter(ip, 'SVDSmoothSec', 0, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+
+% optional ACF peak-count prefilter
+addParameter(ip, 'EnableAcfPeakPrefilter', false, @(x) islogical(x) || isnumeric(x));
+addParameter(ip, 'AcfPeakLagRangeSec', [10 120], @(x) isnumeric(x) && numel(x)==2 && x(1)>=0 && x(2)>x(1));
+addParameter(ip, 'AcfMinProminence', 0.13, @(x) isnumeric(x) && isscalar(x) && x>=0);
+addParameter(ip, 'MinNumAcPeaks', 2, @(x) isnumeric(x) && isscalar(x) && x>=0);
+
+% evaluation / plotting
+addParameter(ip, 'MinClusterSize', 2, @(x) isnumeric(x) && isscalar(x) && x >= 1);
+addParameter(ip, 'DoPlots', true, @(x) islogical(x) || isnumeric(x));
+addParameter(ip, 'Verbose', true, @(x) islogical(x) || isnumeric(x));
+addParameter(ip, 'NumMethodFigures', 3, @(x) isnumeric(x) && isscalar(x) && x>=1);
+
+parse(ip, dff, fps, varargin{:});
+P = ip.Results;
+
+[N0, T] = size(dff);
+
+%% ============================ Base QC ============================
+fracFinite0 = mean(isfinite(dff), 2);
+sd0 = std(dff, 0, 2, 'omitnan');
+keep0 = fracFinite0 >= P.FiniteFracThresh & sd0 > P.MinStd;
+
+keepIdx_base = find(keep0);
+dropIdx_base = find(~keep0);
+
+Xraw_base = dff(keepIdx_base, :);
+Nbase = size(Xraw_base,1);
+
+if Nbase < 4
+    error('Too few neurons survive base preprocessing.');
+end
+
+if P.UseZScore
+    Xz_base = zscore_fill_rows(Xraw_base);
+else
+    Xz_base = Xraw_base;
+    Xz_base(~isfinite(Xz_base)) = 0;
+end
+
+if P.Verbose
+    fprintf('\n=== compare_ensemble_methods_v2 ===\n');
+    fprintf('Input neurons                    : %d\n', N0);
+    fprintf('After base QC                    : %d\n', Nbase);
+    fprintf('Time points                      : %d\n', T);
+end
+
+%% ============================ Precompute ACF / PSD on base set ============================
+if P.Verbose
+    fprintf('Precomputing ACF and PSD features...\n');
+end
+
+[acfFull_base, lagSec] = compute_acf_features(Xz_base, fps, P.AcfMaxLagSec);
+acfMaskFeat = lagSec >= P.AcfFeatureLagRangeSec(1) & lagSec <= P.AcfFeatureLagRangeSec(2);
+Xacf_base = acfFull_base(:, acfMaskFeat);
+
+[domFreq_base, peakPower_base, freqAxis, Pxx_base] = compute_domfreq_psd(Xraw_base, fps, ...
+    P.WelchWinSec, P.WelchOverlapFrac, P.FreqRangeHz);
+
+%% ============================ Optional ACF peak-count prefilter ============================
+prefilter = struct();
+prefilter.enabled = logical(P.EnableAcfPeakPrefilter);
+prefilter.nAcPeaks = nan(Nbase,1);
+prefilter.keepMaskWithinBase = true(Nbase,1);
+prefilter.keepIdxWithinBase = (1:Nbase)';
+prefilter.dropIdxWithinBase = [];
+prefilter.keepIdxOriginal = keepIdx_base;
+prefilter.dropIdxOriginal = dropIdx_base;
+
+if P.EnableAcfPeakPrefilter
+    lagMaskPeaks = lagSec >= P.AcfPeakLagRangeSec(1) & lagSec <= P.AcfPeakLagRangeSec(2);
+    if ~any(lagMaskPeaks)
+        error('No lags fall within AcfPeakLagRangeSec.');
+    end
+
+    for i = 1:Nbase
+        aci = acfFull_base(i, lagMaskPeaks);
+        if all(~isfinite(aci))
+            prefilter.nAcPeaks(i) = 0;
+            prefilter.keepMaskWithinBase(i) = false;
+            continue;
+        end
+        pks = findpeaks(aci, 'MinPeakProminence', P.AcfMinProminence);
+        prefilter.nAcPeaks(i) = numel(pks);
+        prefilter.keepMaskWithinBase(i) = prefilter.nAcPeaks(i) >= P.MinNumAcPeaks;
+    end
+
+    prefilter.keepIdxWithinBase = find(prefilter.keepMaskWithinBase);
+    prefilter.dropIdxWithinBase = find(~prefilter.keepMaskWithinBase);
+    prefilter.keepIdxOriginal = keepIdx_base(prefilter.keepIdxWithinBase);
+    prefilter.dropIdxOriginal = [dropIdx_base; keepIdx_base(prefilter.dropIdxWithinBase)];
+
+    if P.Verbose
+        fprintf('ACF peak-count prefilter ON\n');
+        fprintf('  lag range (s)                 : [%.1f %.1f]\n', P.AcfPeakLagRangeSec(1), P.AcfPeakLagRangeSec(2));
+        fprintf('  min prominence                : %.3f\n', P.AcfMinProminence);
+        fprintf('  min # peaks                   : %d\n', P.MinNumAcPeaks);
+        fprintf('  kept after prefilter          : %d / %d\n', ...
+            nnz(prefilter.keepMaskWithinBase), Nbase);
+    end
+else
+    prefilter.nAcPeaks(:) = NaN;
+end
+
+% apply prefilter to data that enters ensemble comparison
+Xraw = Xraw_base(prefilter.keepMaskWithinBase, :);
+Xz   = Xz_base(prefilter.keepMaskWithinBase, :);
+acfFull = acfFull_base(prefilter.keepMaskWithinBase, :);
+Xacf = Xacf_base(prefilter.keepMaskWithinBase, :);
+domFreq = domFreq_base(prefilter.keepMaskWithinBase);
+peakPower = peakPower_base(prefilter.keepMaskWithinBase);
+Pxx = Pxx_base(prefilter.keepMaskWithinBase, :);
+
+keepIdx = prefilter.keepIdxOriginal;
+dropIdx = prefilter.dropIdxOriginal;
+
+N = size(Xraw,1);
+if N < 4
+    error('Too few neurons remain after optional ACF peak prefilter.');
+end
+
+%% ============================ Cosine-SVD signal ============================
+if P.RunCosineSVD
+    Xsvd = make_svd_signal(Xraw, fps, P.SVDSignalMode, P.SVDSmoothSec);
+    Ctime = cosine_similarity_time(Xsvd);
+
+    for q = P.SVDNumModesList(:)'
+        labels = cosine_svd_assign(Xsvd, Ctime, q);
+        meth = evaluate_solution('cosine_svd', sprintf('Cosine-SVD (modes=%d)', q), ...
+            Xraw, Xz, Xacf, acfFull, lagSec, domFreq, labels, P.MinClusterSize);
+        meth.k = q;
+        methodsCell{end+1,1} = meth; %#ok<AGROW>
+    end
+else
+    Xsvd = [];
+    Ctime = [];
+end
+%% ============================ Run methods ============================
+methodsCell = {};
+
+% ---- dF/F kmeans
+for k = P.KList(:)'
+    labels = run_kmeans_rows(Xz, k, P.Distance, P.Replicates);
+    meth = evaluate_solution('dff_kmeans', sprintf('dF/F kmeans (k=%d)', k), ...
+        Xraw, Xz, Xacf, acfFull, lagSec, domFreq, labels, P.MinClusterSize);
+    meth.k = k;
+    methodsCell{end+1,1} = meth; %#ok<AGROW>
+end
+
+% ---- dF/F PCA + varimax
+for q = unique([P.KList(:); choose_varimax_dims(Xz', P.VarimaxExplainedPct, P.MaxVarimaxComps)])'
+    if q < 2, continue; end
+    labels = pca_varimax_assign(Xz', q);
+    meth = evaluate_solution('dff_pca_varimax', sprintf('dF/F PCA-varimax (q=%d)', q), ...
+        Xraw, Xz, Xacf, acfFull, lagSec, domFreq, labels, P.MinClusterSize);
+    meth.k = q;
+    methodsCell{end+1,1} = meth; %#ok<AGROW>
+end
+
+% ---- ACF kmeans
+for k = P.KList(:)'
+    labels = run_kmeans_rows(Xacf, k, P.Distance, P.Replicates);
+    meth = evaluate_solution('acf_kmeans', sprintf('ACF kmeans (k=%d)', k), ...
+        Xraw, Xz, Xacf, acfFull, lagSec, domFreq, labels, P.MinClusterSize);
+    meth.k = k;
+    methodsCell{end+1,1} = meth; %#ok<AGROW>
+end
+
+% ---- ACF PCA + varimax
+for q = unique([P.KList(:); choose_varimax_dims(Xacf', P.VarimaxExplainedPct, P.MaxVarimaxComps)])'
+    if q < 2, continue; end
+    labels = pca_varimax_assign(Xacf', q);
+    meth = evaluate_solution('acf_pca_varimax', sprintf('ACF PCA-varimax (q=%d)', q), ...
+        Xraw, Xz, Xacf, acfFull, lagSec, domFreq, labels, P.MinClusterSize);
+    meth.k = q;
+    methodsCell{end+1,1} = meth; %#ok<AGROW>
+end
+
+% ---- Cosine-SVD
+if P.RunCosineSVD
+    for q = P.SVDNumModesList(:)'
+        labels = cosine_svd_assign(Xsvd, Ctime, q);
+        meth = evaluate_solution('cosine_svd', sprintf('Cosine-SVD (modes=%d)', q), ...
+            Xraw, Xz, Xacf, acfFull, lagSec, domFreq, labels, P.MinClusterSize);
+        meth.k = q;
+        methodsCell{end+1,1} = meth; %#ok<AGROW>
+    end
+end
+methods = vertcat(methodsCell{:});
+%% ============================ Ranking ============================
+summaryTable = methods_to_table(methods);
+
+score = ...
+    zsafe(summaryTable.meanWithinDffCorr) + ...
+    zsafe(summaryTable.meanWithinAcfCorr) - ...
+    zsafe(summaryTable.meanFreqCV) + ...
+    zsafe(summaryTable.silhouetteMean);
+
+summaryTable.compositeScore = score;
+[~, ord] = sort(summaryTable.compositeScore, 'descend');
+summaryTable = summaryTable(ord, :);
+methods = methods(ord);
+best = methods(1);
+
+if P.Verbose
+    disp(summaryTable(:, {'name','k','nClustersUsed','silhouetteMean', ...
+        'meanWithinDffCorr','meanWithinAcfCorr','meanFreqCV','compositeScore'}));
+end
+
+%% ============================ Output ============================
+OUT = struct();
+OUT.params = P;
+
+OUT.data = struct();
+OUT.data.keepIdx = keepIdx;
+OUT.data.dropIdx = dropIdx;
+OUT.data.keepIdx_baseQC = keepIdx_base;
+OUT.data.dropIdx_baseQC = dropIdx_base;
+
+OUT.data.Xraw = Xraw;
+OUT.data.Xz = Xz;
+OUT.data.Xacf = Xacf;
+OUT.data.acfFull = acfFull;
+OUT.data.lagSec = lagSec;
+OUT.data.domFreq = domFreq;
+OUT.data.peakPower = peakPower;
+OUT.data.freqAxis = freqAxis;
+OUT.data.Pxx = Pxx;
+OUT.data.Xsvd = Xsvd;
+OUT.data.Ctime = Ctime;
+
+OUT.prefilter = prefilter;
+OUT.methods = methods;
+OUT.summaryTable = summaryTable;
+OUT.best = best;
+
+%% ============================ Plots ============================
+if P.DoPlots
+    OUT.fig = make_summary_plots_v2(OUT);
+end
+
+end
+
+%% =======================================================================
+function Xz = zscore_fill_rows(X)
+mu = mean(X, 2, 'omitnan');
+sd = std(X, 0, 2, 'omitnan');
+sd(sd == 0 | ~isfinite(sd)) = 1;
+Xz = (X - mu) ./ sd;
+Xz(~isfinite(Xz)) = 0;
+end
+
+%% =======================================================================
+function [acfFull, lagSec] = compute_acf_features(X, fps, maxLagSec)
+N = size(X,1);
+maxLag = max(1, round(maxLagSec * fps));
+lagSec = (-maxLag:maxLag) / fps;
+acfFull = nan(N, numel(lagSec));
+
+for i = 1:N
+    xi = X(i,:);
+    xi = xi(isfinite(xi));
+    if numel(xi) < maxLag + 5
+        continue;
+    end
+    xi = xi - mean(xi);
+    acfFull(i,:) = xcorr(xi, maxLag, 'coeff');
+end
+end
+
+%% =======================================================================
+function [domFreq, peakPower, fAxis, PxxAll] = compute_domfreq_psd(Xraw, fps, winSec, overlapFrac, freqRange)
+N = size(Xraw,1);
+nwin = max(16, round(winSec * fps));
+nwin = min(nwin, size(Xraw,2));
+nover = round(nwin * overlapFrac);
+nfft = max(256, 2^nextpow2(nwin));
+
+domFreq = nan(N,1);
+peakPower = nan(N,1);
+PxxAll = [];
+fAxis = [];
+
+for i = 1:N
+    xi = Xraw(i,:)';
+    xi = fillmissing(xi, 'linear', 'EndValues', 'nearest');
+    if any(~isfinite(xi)), continue; end
+
+    [Pxx, f] = pwelch(xi, hann(nwin), nover, nfft, fps);
+
+    if isempty(PxxAll)
+        PxxAll = nan(N, numel(Pxx));
+        fAxis = f;
+    end
+    PxxAll(i,:) = Pxx(:)';
+
+    mask = f >= freqRange(1) & f <= freqRange(2);
+    if ~any(mask), continue; end
+    [mx, idx] = max(Pxx(mask));
+    fsub = f(mask);
+    domFreq(i) = fsub(idx);
+    peakPower(i) = mx;
+end
+end
+
+%% =======================================================================
+function Xsvd = make_svd_signal(Xraw, fps, modeName, smoothSec)
+Xsvd = Xraw;
+
+switch lower(string(modeName))
+    case "dff"
+    case "diff"
+        Xsvd = [zeros(size(Xraw,1),1), diff(Xraw,1,2)];
+    case "positive_diff"
+        Xsvd = [zeros(size(Xraw,1),1), diff(Xraw,1,2)];
+        Xsvd(Xsvd < 0) = 0;
+    otherwise
+        error('Unknown SVDSignalMode.');
+end
+
+if smoothSec > 0
+    w = max(1, round(smoothSec * fps));
+    Xsvd = movmean(Xsvd, w, 2, 'omitnan');
+end
+
+Xsvd = zscore_fill_rows(Xsvd);
+end
+
+%% =======================================================================
+function C = cosine_similarity_time(X)
+Xt = X';
+norms = sqrt(sum(Xt.^2, 2));
+norms(norms == 0) = 1;
+Xt = Xt ./ norms;
+C = Xt * Xt';
+C(~isfinite(C)) = 0;
+end
+
+%% =======================================================================
+function labels = run_kmeans_rows(F, k, distName, reps)
+labels = kmeans(F, k, ...
+    'Distance', distName, ...
+    'Replicates', reps, ...
+    'MaxIter', 1000, ...
+    'Display', 'off');
+labels = labels(:);
+end
+
+%% =======================================================================
+function q = choose_varimax_dims(obsByFeat, explainedPctTarget, maxQ)
+[~,~,~,~,explained] = pca(obsByFeat);
+cumexp = cumsum(explained);
+q = find(cumexp >= explainedPctTarget, 1, 'first');
+if isempty(q), q = min(size(obsByFeat,2), maxQ); end
+q = max(2, min(q, maxQ));
+end
+
+%% =======================================================================
+function labels = pca_varimax_assign(obsByFeat, q)
+[coeff, ~] = pca(obsByFeat, 'NumComponents', q);
+L = coeff(:,1:q);
+Lrot = local_varimax(L);
+[~, labels] = max(abs(Lrot), [], 2);
+labels = labels(:);
+end
+
+%% =======================================================================
+function labels = cosine_svd_assign(Xsvd, Ctime, q)
+% Xsvd: neurons x time
+% Ctime: time x time cosine similarity
+
+if isempty(Xsvd) || isempty(Ctime)
+    error('cosine_svd_assign called with empty Xsvd/Ctime.');
+end
+
+[U, S, ~] = svd(Ctime, 'econ');
+
+qEff = min([q, size(U,2), size(S,1), size(S,2)]);
+if qEff < 1
+    error('No valid SVD modes available.');
+end
+
+modes = U(:,1:qEff) * sqrt(S(1:qEff,1:qEff));   % time x qEff
+
+N = size(Xsvd,1);
+scores = nan(N, qEff);
+
+for i = 1:N
+    xi = Xsvd(i,:)';
+    for j = 1:qEff
+        c = corr(xi, modes(:,j), 'rows', 'pairwise');
+        if isnan(c), c = 0; end
+        scores(i,j) = c;
+    end
+end
+
+[~, labels] = max(abs(scores), [], 2);
+labels = labels(:);
+end
+
+%% =======================================================================
+function meth = evaluate_solution(codeName, displayName, Xraw, Xz, Xacf, acfFull, lagSec, domFreq, labels, minClusterSize)
+labels = labels(:);
+u = unique(labels(:)');
+u = u(~isnan(u));
+
+clusterSizes = zeros(numel(u),1);
+withinDff = nan(numel(u),1);
+withinAcf = nan(numel(u),1);
+freqCV = nan(numel(u),1);
+meanAcfByCluster = cell(numel(u),1);
+
+for ii = 1:numel(u)
+    idx = labels == u(ii);
+    clusterSizes(ii) = sum(idx);
+
+    if clusterSizes(ii) >= minClusterSize
+        withinDff(ii) = mean_offdiag_corr(Xz(idx,:));
+        withinAcf(ii) = mean_offdiag_corr(Xacf(idx,:));
+
+        f = domFreq(idx);
+        f = f(isfinite(f) & f > 0);
+        if numel(f) >= 2
+            freqCV(ii) = std(f) / mean(f);
+        end
+
+        meanAcfByCluster{ii} = mean(acfFull(idx,:), 1, 'omitnan');
+    else
+        meanAcfByCluster{ii} = nan(1, size(acfFull,2));
+    end
+end
+
+silhMean = NaN;
+try
+    if numel(u) >= 2 && all(clusterSizes >= 2)
+        sil = silhouette(Xz, labels, 'correlation');
+        silhMean = mean(sil);
+    end
+catch
+end
+
+meth = struct();
+meth.code = codeName;
+meth.name = displayName;
+meth.labels = labels;
+meth.k = numel(u);
+meth.clusterIDs = u(:);
+meth.clusterSizes = clusterSizes(:);
+
+meth.eval = struct();
+meth.eval.nClustersUsed = sum(clusterSizes >= minClusterSize);
+meth.eval.withinDffCorrByCluster = withinDff(:);
+meth.eval.withinAcfCorrByCluster = withinAcf(:);
+meth.eval.freqCVByCluster = freqCV(:);
+meth.eval.meanWithinDffCorr = mean(withinDff, 'omitnan');
+meth.eval.meanWithinAcfCorr = mean(withinAcf, 'omitnan');
+meth.eval.meanFreqCV = mean(freqCV, 'omitnan');
+meth.eval.silhouetteMean = silhMean;
+meth.eval.meanAcfByCluster = meanAcfByCluster;
+meth.eval.lagSec = lagSec;
+
+% convenience aliases for table code
+meth.nClustersUsed = meth.eval.nClustersUsed;
+meth.meanWithinDffCorr = meth.eval.meanWithinDffCorr;
+meth.meanWithinAcfCorr = meth.eval.meanWithinAcfCorr;
+meth.meanFreqCV = meth.eval.meanFreqCV;
+meth.silhouetteMean = meth.eval.silhouetteMean;
+end
+
+%% =======================================================================
+function r = mean_offdiag_corr(F)
+if size(F,1) < 2
+    r = NaN;
+    return;
+end
+C = corr(F', 'rows', 'pairwise');
+mask = triu(true(size(C)), 1);
+vals = C(mask);
+r = mean(vals, 'omitnan');
+end
+
+%% =======================================================================
+function T = methods_to_table(methods)
+n = numel(methods);
+name = strings(n,1);
+code = strings(n,1);
+k = nan(n,1);
+nClustersUsed = nan(n,1);
+silhouetteMean = nan(n,1);
+meanWithinDffCorr = nan(n,1);
+meanWithinAcfCorr = nan(n,1);
+meanFreqCV = nan(n,1);
+
+for i = 1:n
+    name(i) = string(methods(i).name);
+    code(i) = string(methods(i).code);
+    k(i) = methods(i).k;
+    nClustersUsed(i) = methods(i).nClustersUsed;
+    silhouetteMean(i) = methods(i).silhouetteMean;
+    meanWithinDffCorr(i) = methods(i).meanWithinDffCorr;
+    meanWithinAcfCorr(i) = methods(i).meanWithinAcfCorr;
+    meanFreqCV(i) = methods(i).meanFreqCV;
+end
+
+T = table(name, code, k, nClustersUsed, silhouetteMean, ...
+    meanWithinDffCorr, meanWithinAcfCorr, meanFreqCV);
+end
+
+%% =======================================================================
+function z = zsafe(x)
+x = x(:);
+mu = mean(x, 'omitnan');
+sd = std(x, 'omitnan');
+if ~isfinite(sd) || sd == 0
+    z = zeros(size(x));
+else
+    z = (x - mu) / sd;
+end
+end
+
+%% =======================================================================
+function figs = make_summary_plots_v2(OUT)
+P = OUT.params;
+T = OUT.summaryTable;
+figs = struct();
+
+% ---------- summary comparison ----------
+figs.summary = figure('Color','w','Position',[100 80 1450 920], 'Name','Ensemble method comparison V2');
+tlo = tiledlayout(2,3, 'TileSpacing','compact', 'Padding','compact');
+
+ax1 = nexttile(tlo);
+bar(ax1, categorical(T.name), T.meanWithinDffCorr);
+ylabel(ax1, 'Mean within-cluster dF/F corr');
+title(ax1, 'dF/F coherence');
+xtickangle(ax1, 35);
+
+ax2 = nexttile(tlo);
+bar(ax2, categorical(T.name), T.meanWithinAcfCorr);
+ylabel(ax2, 'Mean within-cluster ACF corr');
+title(ax2, 'ACF coherence');
+xtickangle(ax2, 35);
+
+ax3 = nexttile(tlo);
+bar(ax3, categorical(T.name), T.meanFreqCV);
+ylabel(ax3, 'Mean within-cluster freq CV');
+title(ax3, 'Frequency dispersion (lower better)');
+xtickangle(ax3, 35);
+
+ax4 = nexttile(tlo);
+bar(ax4, categorical(T.name), T.silhouetteMean);
+ylabel(ax4, 'Silhouette');
+title(ax4, 'Cluster separation');
+xtickangle(ax4, 35);
+
+ax5 = nexttile(tlo);
+bar(ax5, categorical(T.name), T.compositeScore);
+ylabel(ax5, 'Composite score');
+title(ax5, 'Overall ranking');
+xtickangle(ax5, 35);
+
+ax6 = nexttile(tlo);
+best = OUT.best;
+labs = best.labels;
+u = unique(labs);
+counts = arrayfun(@(x) sum(labs == x), u);
+bar(ax6, u, counts);
+xlabel(ax6, 'Ensemble');
+ylabel(ax6, 'Neuron count');
+title(ax6, sprintf('Best method: %s', best.name));
+
+% ---------- prefilter figure ----------
+figs.prefilter = figure('Color','w','Position',[120 110 1250 420], 'Name','ACF prefilter diagnostics');
+tlo2 = tiledlayout(1,3, 'TileSpacing','compact', 'Padding','compact');
+
+axA = nexttile(tlo2);
+bar(axA, [numel(OUT.data.keepIdx_baseQC), numel(OUT.data.keepIdx)]);
+set(axA, 'XTickLabel', {'Base QC','After ACF prefilter'});
+ylabel(axA, 'Neuron count');
+title(axA, 'Prefilter effect');
+
+axB = nexttile(tlo2);
+if OUT.prefilter.enabled
+    histogram(axB, OUT.prefilter.nAcPeaks, 'BinMethod', 'integers');
+    hold(axB,'on');
+    xline(axB, P.MinNumAcPeaks, 'r--', 'Min peaks');
+    xlabel(axB, '# ACF peaks');
+    ylabel(axB, 'Count');
+    title(axB, 'ACF peak counts');
+else
+    axis(axB,'off');
+    text(axB, 0.5, 0.5, 'ACF prefilter disabled', 'HorizontalAlignment','center');
+end
+
+axC = nexttile(tlo2);
+imagesc(axC, OUT.data.Xz);
+xlabel(axC, 'Time');
+ylabel(axC, 'Kept neurons');
+title(axC, 'Final neuron set entering comparison');
+colormap(axC, parula);
+
+% ---------- top method figures ----------
+nShow = min(P.NumMethodFigures, numel(OUT.methods));
+figs.methodFigures = gobjects(nShow,1);
+
+for ii = 1:nShow
+    meth = OUT.methods(ii);
+    figs.methodFigures(ii) = make_one_method_figure(OUT, meth, ii);
+end
+end
+
+%% =======================================================================
+function f = make_one_method_figure(OUT, meth, rankIdx)
+Xz = OUT.data.Xz;
+acfFull = OUT.data.acfFull;
+lagSec = OUT.data.lagSec;
+domFreq = OUT.data.domFreq;
+
+labels = meth.labels(:);
+[u,~,g] = unique(labels);
+clusterSizes = arrayfun(@(x) sum(labels==x), u);
+
+% sort by ensemble then by domFreq within ensemble
+ord = [];
+for i = 1:numel(u)
+    idx = find(labels == u(i));
+    [~, o2] = sort(domFreq(idx), 'ascend', 'MissingPlacement','last');
+    ord = [ord; idx(o2)]; %#ok<AGROW>
+end
+
+labelsOrd = labels(ord);
+cuts = find(diff(labelsOrd) ~= 0);
+
+f = figure('Color','w','Position',[110 70 1550 920], ...
+    'Name', sprintf('Method rank %d: %s', rankIdx, meth.name));
+
+tlo = tiledlayout(2,3, 'TileSpacing','compact', 'Padding','compact');
+
+% --- panel 1: dff matrix per ensemble
+ax1 = nexttile(tlo, [2 1]);
+imagesc(ax1, Xz(ord,:));
+xlabel(ax1, 'Time');
+ylabel(ax1, 'Neuron');
+title(ax1, sprintf('dF/F matrix sorted by ensemble: %s', meth.name));
+hold(ax1,'on');
+for i = 1:numel(cuts)
+    yline(ax1, cuts(i)+0.5, 'w-', 'LineWidth', 1.5);
+end
+colormap(ax1, parula);
+
+% label ensemble blocks
+y0 = 1;
+for i = 1:numel(u)
+    n = sum(labelsOrd == u(i));
+    yc = y0 + (n-1)/2;
+    text(ax1, -0.02*size(Xz,2), yc, sprintf('E%d', u(i)), ...
+        'HorizontalAlignment','right', 'FontWeight','bold', 'Color','w');
+    y0 = y0 + n;
+end
+
+% --- panel 2: ACF matrix per ensemble
+ax2 = nexttile(tlo, 2);
+imagesc(ax2, lagSec, 1:size(acfFull,1), acfFull(ord,:));
+xlabel(ax2, 'Lag (s)');
+ylabel(ax2, 'Neuron');
+title(ax2, 'ACF of neurons sorted by ensemble');
+hold(ax2,'on');
+for i = 1:numel(cuts)
+    yline(ax2, cuts(i)+0.5, 'w-', 'LineWidth', 1.5);
+end
+colormap(ax2, turbo);
+
+% --- panel 3: mean ACF by ensemble
+ax3 = nexttile(tlo, 3); hold(ax3,'on');
+for i = 1:numel(u)
+    idx = labels == u(i);
+    mu = mean(acfFull(idx,:), 1, 'omitnan');
+    plot(ax3, lagSec, mu, 'LineWidth', 1.5);
+end
+xlabel(ax3, 'Lag (s)');
+ylabel(ax3, 'Mean ACF');
+title(ax3, 'Mean ACF per ensemble');
+legend(ax3, compose('E%d', u), 'Location','best');
+
+% --- panel 4: dominant frequency by ensemble
+ax4 = nexttile(tlo, 5);
+boxchart(ax4, labels, domFreq);
+xlabel(ax4, 'Ensemble');
+ylabel(ax4, 'Dominant frequency (Hz)');
+title(ax4, 'Dominant frequency by ensemble');
+
+% --- panel 5: evaluation scores
+ax5 = nexttile(tlo, 6);
+metricNames = {'Within dF/F corr','Within ACF corr','1 - Freq CV','Silhouette'};
+vals = [meth.eval.meanWithinDffCorr, ...
+        meth.eval.meanWithinAcfCorr, ...
+        1 - meth.eval.meanFreqCV, ...
+        meth.eval.silhouetteMean];
+bar(ax5, vals);
+set(ax5, 'XTick', 1:numel(vals), 'XTickLabel', metricNames);
+xtickangle(ax5, 25);
+ylabel(ax5, 'Score');
+title(ax5, sprintf('Evaluation summary | used clusters = %d', meth.eval.nClustersUsed));
+
+% annotate cluster sizes
+txt = sprintf('Cluster sizes: %s', strjoin(string(clusterSizes(:)'), ', '));
+annotation(f, 'textbox', [0.62 0.49 0.34 0.05], 'String', txt, ...
+    'EdgeColor', 'none', 'HorizontalAlignment', 'right', 'FontWeight', 'bold');
+end
+
+%% =======================================================================
+function R = local_varimax(Phi)
+gamma = 1;
+q = 100;
+tol = 1e-6;
+
+[p, k] = size(Phi);
+R = eye(k);
+d_old = 0;
+
+for i = 1:q
+    Lambda = Phi * R;
+    u = sum(Lambda.^2, 1);
+    tmp = Lambda.^3 - (gamma / p) * Lambda .* u;
+    [U, S, V] = svd(Phi' * tmp, 'econ');
+    R = U * V';
+    d = sum(diag(S));
+    if d_old ~= 0 && d/d_old < 1 + tol
+        break;
+    end
+    d_old = d;
+end
+
+R = Phi * R;
+end
