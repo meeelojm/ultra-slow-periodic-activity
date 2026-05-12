@@ -810,6 +810,7 @@ end
     boxchart(ones(numel(yLow),1)*1, yLow);
     boxchart(ones(numel(yHigh),1)*2, yHigh);
 
+    idxB = find(validRecB(:))';
     for i = idxB
         plot(xPair, [R.low_bandPower_median(i), R.high_bandPower_median(i)], '-o', ...
             'Color', [0.4 0.4 0.4], 'MarkerFaceColor', 'w');
